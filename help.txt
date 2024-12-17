@@ -1,0 +1,11 @@
+Usage (order of arguments is fixed):
+
+    tcp [-s] PORT [ADDRESS [SIZE]]
+
+Connects to (or listens on, if `-s` is present) the given port, where
+ADDRESS defaults to localhost.  read(2) and write(2) use a buffer of
+SIZE bytes, defaulting to 1024.
+
+The server accepts clients one by one.  Both, client and server, will
+terminate when the peer disconnects, usually triggered by pressing C-d
+(aka. ^D).
