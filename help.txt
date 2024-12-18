@@ -1,11 +1,16 @@
-Usage (order of arguments is fixed):
+Usage:
 
-    tcp [-s] PORT [ADDRESS [SIZE]]
+    tcp [-s] [-q] [-bSIZE] SERVICE [HOST]
 
-Connects to (or listens on, if `-s` is present) the given port, where
-ADDRESS defaults to localhost.  read(2) and write(2) use a buffer of
-SIZE bytes, defaulting to 1024.
+Create TCP/IP connection to SERVICE of HOST, default `localhost`.
 
-The server accepts clients one by one.  Both, client and server, will
-terminate when the peer disconnects, usually triggered by pressing C-d
-(aka. ^D).
+  -s — Be a server (bind(2), listen(2), accept(2)), rather than a client
+    (connect(2)).  Handles clients one by one.  Terminate with Ctrl+C.
+
+  -q — Quit after serving first client, implies `-s`.
+
+  -bSIZE — Buffer for read(2) and write(2), defaults to 1024, accepts
+     metric and binary suffix.
+
+When a peer disconnects (Ctrl+D without input, or Ctrl+C), then the
+client terminates, the server accepts the next client (unless `-q`).

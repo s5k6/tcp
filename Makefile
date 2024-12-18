@@ -13,6 +13,7 @@ clean :
 
 tcp : tcp.o
 	gcc -o $@ $^
+	strip tcp
 
 tcp.o : help.inc
 

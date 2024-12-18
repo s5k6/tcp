@@ -49,18 +49,20 @@ unsigned long int suffixed(const char *arg, const struct suffix *suffix) {
 // representation of socket address
 
 const char *sockaddr2string(
-    const struct sockaddr *sa, char *dst, socklen_t lim
+    const struct sockaddr *sa, char *dst, socklen_t lim, in_port_t *port
 ) {
 
-    if (sa->sa_family == AF_INET)
-        return inet_ntop(
-            AF_INET, &(((struct sockaddr_in *)sa)->sin_addr), dst, lim
-        );
+    if (sa->sa_family == AF_INET) {
+        struct sockaddr_in *sin = (struct sockaddr_in *)sa;
+        *port = ntohs(sin->sin_port);
+        return inet_ntop(AF_INET, &(sin->sin_addr), dst, lim);
+    }
 
-    if (sa->sa_family == AF_INET6)
-        return inet_ntop(
-            AF_INET6, &(((struct sockaddr_in6 *)sa)->sin6_addr), dst, lim
-        );
+    if (sa->sa_family == AF_INET6) {
+        struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)sa;
+        *port = ntohs(sin6->sin6_port);
+        return inet_ntop(AF_INET6, &(sin6->sin6_addr), dst, lim);
+    }
 
     return NULL;
 }
@@ -110,11 +112,11 @@ ssize_t transfer(int from, int to) {
 /* Add pre-populated epoll_event struct with new file descriptor f,
 and handle errors. */
 
-#define epoll_add(efd, ev, f)                                           \
+#define epoll_add(EFD, EVENT, FD)                                       \
     do {                                                                \
-        (ev).data.fd = (f);                                             \
-        if (epoll_ctl(efd, EPOLL_CTL_ADD, (ev).data.fd, &(ev)) == -1)   \
-            err(1, "epoll_ctl(%d, %d)", efd, (ev).data.fd);             \
+        (EVENT).data.fd = (FD);                                         \
+        if (epoll_ctl(EFD, EPOLL_CTL_ADD, (FD), &(EVENT)) == -1)        \
+            err(1, "epoll_ctl(%d, %d)", EFD, (EVENT).data.fd);          \
     } while(0)
 
 
@@ -168,12 +170,6 @@ void communicate(int conn) {
     if (sig)
         warnx("Communicating loop caught signal %d", sig);
 
-
-    // cleanup
-
-    if (shutdown(conn, SHUT_RDWR))
-        warn("shutdown(%d)", conn);
-
     if (close(conn))
         warn("close(%d)", conn);
 
@@ -190,8 +186,8 @@ int main(int argc, char **argv) {
 
     // CLI arguments
 
-    int serverRole = 0;
-    const char *port;
+    int serverRole = 0, quitAfter = 0;
+    const char *service;
     const char *host = "localhost";
     bufSize = 1024;
 
@@ -205,27 +201,39 @@ int main(int argc, char **argv) {
 
     // parse CLI
     {
-        int i = 1;
+        int parc = 0;
+        char *parv[argc];
 
-        if (strcmp("-s", argv[i]) == 0) {
-            i += 1;
-            serverRole = 1;
+        // find optional flags amongst (ordered) parameters
+        for (int i = 1; i < argc; i++) {
+            if (argv[i][0] == '-')
+                if (strcmp("-s", argv[i]) == 0)
+                    serverRole = 1;
+                else if (strcmp("-q", argv[i]) == 0)
+                    quitAfter = 1;
+                else if (strncmp("-b", argv[i], 2) == 0)
+                    bufSize = (size_t)suffixed(argv[i]+2, volume);
+                else
+                    errx(1, "Unknown flag: %s", argv[i]);
+            else
+                parv[parc++] = argv[i];
         }
+        serverRole = serverRole || quitAfter;
 
-        port = argv[i++];
+        if (parc < 1)
+            errx(1, "Run without arguments for help.");
+        service = parv[0];
 
-        if (argc > i)
-            host = argv[i++];
+        if (parc > 1)
+            host = parv[1];
 
-        if (argc > i)
-            bufSize = (size_t)suffixed(argv[i], volume);
-
-        // print report about what will be done
         warnx(
-            "Will %s %s, port %s, using %zu bytes buffer.",
-            serverRole ? "serve on" : "connect to",
-            host, port, bufSize
+            "pid %d, mode %s, service %s, address %s, buf %zu",
+            getpid(),
+            serverRole ? (quitAfter ? "serve once" : "serve many") : "client",
+            service, host, bufSize
         );
+
     }
 
 
@@ -235,9 +243,11 @@ int main(int argc, char **argv) {
         err(1, "malloc(%zu)", bufSize);
 
 
-    // Set up signal handler for SIGINT, usually issued by pressing C-c.
+    /* Set up signal handlers: SIGINT, usually issued by pressing C-c.
+    SIGPIPE, because we want to produce error messages instead of
+    being killed. */
     {
-        int handle[] = { SIGINT, 0 };
+        int handle[] = { SIGINT, SIGPIPE, 0 };
 
         struct sigaction action;
         memset(&action, 0, sizeof(action));
@@ -263,9 +273,9 @@ int main(int argc, char **argv) {
         hints.ai_family = AF_UNSPEC;
         hints.ai_socktype = SOCK_STREAM;
 
-        int s = getaddrinfo(host, port, &hints, &result);
+        int s = getaddrinfo(host, service, &hints, &result);
         if (s) // getaddrinfo does not use errno
-            errx(1, "getaddrinfo(%s, %s): %s", host, port, gai_strerror(s));
+            errx(1, "getaddrinfo(%s, %s): %s", host, service, gai_strerror(s));
     }
 
 
@@ -278,12 +288,13 @@ int main(int argc, char **argv) {
         for (rp = result; rp; rp = rp->ai_next) {
 
             char text[512];
-            if (!sockaddr2string(rp->ai_addr, text, sizeof(text)))
+            in_port_t port;
+            if (!sockaddr2string(rp->ai_addr, text, sizeof(text), &port))
                 err(1, "sockaddr2string");
 
             sock = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
             if (sock < 0) {
-                warn("socket(%s)", text);
+                warn("socket(%s port %d)", text, port);
                 continue;
             }
 
@@ -292,9 +303,9 @@ int main(int argc, char **argv) {
                 err(1, "setsockopt(%d)", sock);
 
             if (bind(sock, rp->ai_addr, rp->ai_addrlen))
-                warn("bind(%d, %s)", sock, text);
+                warn("bind(%d, %s port %d)", sock, text, port);
             else {
-                warnx("Bound socket %d to %s", sock, text);
+                warnx("Bound socket %d to %s port %d", sock, text, port);
                 if (listen(sock, 0))
                     warn("listen(%d)", sock);
                 else
@@ -349,9 +360,12 @@ int main(int argc, char **argv) {
                         warn("accept(%d)", sock);
                     else {
                         char remote[512];
-                        if (!sockaddr2string(&peer, remote, sizeof(remote)))
+                        in_port_t port;
+                        if (!sockaddr2string(
+                                &peer, remote, sizeof(remote), &port
+                            ))
                             err(1, "sockaddr2string");
-                        warnx("Connected from %s", remote);
+                        warnx("Connected from %s port %d", remote, port);
 
                         communicate(conn);  // will close conn socket
                     }
@@ -362,8 +376,10 @@ int main(int argc, char **argv) {
 
             } // iterating over events
 
-        } while (sig == 0);
-        warnx("Accepting loop caught signal %d", sig);
+        } while (sig == 0 && quitAfter == 0);
+
+        if (sig)
+            warnx("Accepting loop caught signal %d", sig);
 
         close(sock);
 
@@ -375,20 +391,21 @@ int main(int argc, char **argv) {
         for (rp = result; rp; rp = rp->ai_next) {
 
             char text[512];
-            if (!sockaddr2string(rp->ai_addr, text, sizeof(text)))
+            in_port_t port;
+            if (!sockaddr2string(rp->ai_addr, text, sizeof(text), &port))
                 err(1, "sockaddr2string");
 
             sock = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
             if (sock < 0) {
-                warn("socket(%s)", text);
+                warn("socket(%s port %d)", text, port);
                 continue;
             }
 
             if (connect(sock, rp->ai_addr, rp->ai_addrlen) > -1) {
-                warnx("Connected to %s", text);
+                warnx("Connected to %s port %d", text, port);
                 break;
             }
-            warn("connect(%s)", text);
+            warn("connect(%s port %d)", text, port);
             close(sock); // was invalid
         }
 
