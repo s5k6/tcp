@@ -331,6 +331,7 @@ int main(int argc, char **argv) {
         }
 
         // this is the server loop, handling clients one by one
+        int run = 1;
         do {
             warnx("Waiting for connection...");
 
@@ -350,6 +351,7 @@ int main(int argc, char **argv) {
                     ssize_t c = read(0, buf, bufSize);
                     if (c < 0)
                         err(1, "read(0)");
+                    warnx("Discard %zu bytes", c);
 
                 } else if (events[i].data.fd == sock) {
 
@@ -368,6 +370,9 @@ int main(int argc, char **argv) {
                         warnx("Connected from %s port %d", remote, port);
 
                         communicate(conn);  // will close conn socket
+
+                        if (quitAfter)
+                            run = 0;
                     }
 
                 } else {
@@ -376,7 +381,7 @@ int main(int argc, char **argv) {
 
             } // iterating over events
 
-        } while (sig == 0 && quitAfter == 0);
+        } while (sig == 0 && run);
 
         if (sig)
             warnx("Accepting loop caught signal %d", sig);

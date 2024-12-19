@@ -4,13 +4,13 @@ Usage:
 
 Create TCP/IP connection to SERVICE of HOST, default `localhost`.
 
-  -s — Be a server (bind(2), listen(2), accept(2)), rather than a client
-    (connect(2)).  Handles clients one by one.  Terminate with Ctrl+C.
+  -s — Be a server, rather than a client.  Handles clients one by one.
+    Terminate with Ctrl+C.
 
   -q — Quit after serving first client, implies `-s`.
 
-  -bSIZE — Buffer for read(2) and write(2), defaults to 1024, accepts
-     metric and binary suffix.
+  -bSIZE — Buffer size for all reading and writing, defaults to 1024,
+    accepts metric and binary suffix.
 
 When a peer disconnects (Ctrl+D without input, or Ctrl+C), then the
 client terminates, the server accepts the next client (unless `-q`).
