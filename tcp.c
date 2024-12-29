@@ -3,15 +3,17 @@
 #include <arpa/inet.h>
 #include <err.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/epoll.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
-#include <sys/epoll.h>
 
 
 
@@ -51,16 +53,18 @@ unsigned long int suffixed(const char *arg, const struct suffix *suffix) {
 
 static struct {
     int serverRole;
-    int quitAfter;
+    int allowHalf;
     const char *service;
     const char *host;
+    char **cmdv;
     size_t bufSize;
 } cfg = {
     .serverRole = 0,
-    .quitAfter = 0,
+    .allowHalf = 1,
     .service = NULL,
     .host = "localhost",
-    .bufSize = 1024
+    .cmdv = NULL,
+    .bufSize = 0
 };
 
 
@@ -94,7 +98,8 @@ const char *sockaddr2string(
 static int sig = 0; // Last signal received
 
 static void handler(int s) {
-    sig = s;
+    if (s != SIGCHLD)
+        sig = s;
 }
 
 
@@ -129,12 +134,19 @@ and handle errors. */
     do {                                                                \
         (EVENT).data.fd = (FD);                                         \
         if (epoll_ctl(EFD, EPOLL_CTL_ADD, (FD), &(EVENT)) == -1)        \
-            err(1, "epoll_ctl(%d, %d)", EFD, (EVENT).data.fd);          \
+            err(1, "epoll_add(%d, %d)", EFD, (EVENT).data.fd);          \
+    } while(0)
+
+
+#define epoll_del(EFD, FD)                                              \
+    do {                                                                \
+        if (epoll_ctl(EFD, EPOLL_CTL_DEL, (FD), NULL) == -1)            \
+            err(1, "epoll_del(%d, %d)", EFD, (FD));                     \
     } while(0)
 
 
 
-// communication over established connectio
+// communication over established connections
 
 void communicate(int conn) {
 
@@ -147,7 +159,7 @@ void communicate(int conn) {
 
         struct epoll_event ev;
         ev.events = EPOLLIN;
-        epoll_add(epollfd, ev, 0);
+        epoll_add(epollfd, ev, STDIN_FILENO);
         epoll_add(epollfd, ev, conn);
     }
 
@@ -158,7 +170,7 @@ void communicate(int conn) {
     if (buf == NULL)
         err(1, "malloc(%zu)", cfg.bufSize);
 
-    int run = 1;
+    int sending = 1, recving = 1;
     do {
 
         const int maxEvents = 10;
@@ -171,18 +183,32 @@ void communicate(int conn) {
                 err(1, "epoll_wait(%d)", epollfd);
 
         for (ssize_t i = 0; i < eventCount; i++) {
-            if (events[i].data.fd == 0) { // stdin
-                if (transfer(0, conn, buf) < 1)
-                    run = 0;
+            if (events[i].data.fd == STDIN_FILENO) { // stdin
+                if (transfer(STDIN_FILENO, conn, buf) < 1) {
+                    sending = 0;
+                    epoll_del(epollfd, STDIN_FILENO);
+                    shutdown(STDIN_FILENO, SHUT_RD);
+                    shutdown(conn, SHUT_WR);
+                    warnx("Shut down send direction.");
+                }
             } else if (events[i].data.fd == conn) {
-                if (transfer(conn, 1, buf) < 1)
-                    run = 0;
+                if (transfer(conn, STDOUT_FILENO, buf) < 1) {
+                    recving = 0;
+                    epoll_del(epollfd, conn);
+                    shutdown(conn, SHUT_RD);
+                    shutdown(STDIN_FILENO, SHUT_WR);
+                    warnx("Shut down recv direction.");
+                }
             } else {
                 errx(1, "unexpected event");
             }
         } // iterating over events
 
-    } while (sig == 0 && run);
+    } while (
+        sig == 0
+        &&
+        (cfg.allowHalf ? sending || recving : sending && recving)
+    );
 
     free(buf);
 
@@ -190,7 +216,45 @@ void communicate(int conn) {
         warnx("Communicating loop caught signal %d", sig);
 
     if (close(conn))
-        warn("close(%d)", conn);
+        err(1, "close(%d)", conn);
+
+    warnx("Closed connection.");
+}
+
+
+
+void execCommand(int conn) {  // will not return
+
+    if (dup2(conn, STDIN_FILENO) < 0)
+        err(1, "dup2(%d, %d)", conn, STDIN_FILENO);
+
+    if (dup2(conn, STDOUT_FILENO) < 0)
+        err(1, "dup2(%d, %d)", conn, STDOUT_FILENO);
+
+    if (close(conn) < 0)
+        err(1, "close");
+
+    execvp(cfg.cmdv[0], cfg.cmdv);
+    err(1, "execv(%s, ...)", cfg.cmdv[0]);
+
+}
+
+
+
+void forkCommand(int conn) {
+
+    pid_t pid = fork();
+    if (pid < 0)
+        err(1, "fork");
+
+    if (pid == 0)
+        execCommand(conn); // will not return
+
+    // parent process
+    if (close(conn) < 0)
+        err(1, "close");
+
+    warnx("Connection %d delegated to process %u", conn, pid);
 
 }
 
@@ -242,7 +306,7 @@ void serve(const struct addrinfo *result) {
 
         struct epoll_event ev;
         ev.events = EPOLLIN;
-        epoll_add(epollfd, ev, 0);
+        epoll_add(epollfd, ev, STDIN_FILENO);
         epoll_add(epollfd, ev, sock);
     }
 
@@ -260,14 +324,13 @@ void serve(const struct addrinfo *result) {
             if (errno != EINTR)
                 err(1, "epoll_wait(%d)", epollfd);
 
-
         for (ssize_t i = 0; i < eventCount; i++) {
 
-            if (events[i].data.fd == 0) { // discard stdin
+            if (events[i].data.fd == STDIN_FILENO) { // discard stdin
                 char *buf[512];
-                ssize_t c = read(0, buf, sizeof(buf));
+                ssize_t c = read(STDIN_FILENO, buf, sizeof(buf));
                 if (c < 0)
-                    err(1, "read(0)");
+                    err(1, "read(%d)", STDIN_FILENO);
                 warnx("Discard %zu bytes", c);
 
             } else if (events[i].data.fd == sock) {
@@ -286,10 +349,10 @@ void serve(const struct addrinfo *result) {
                         err(1, "sockaddr2string");
                     warnx("Connected from %s port %d", remote, port);
 
-                    communicate(conn);  // will close conn socket
-
-                    if (cfg.quitAfter)
-                        run = 0;
+                    if (cfg.cmdv)
+                        forkCommand(conn);
+                    else
+                        communicate(conn);
                 }
 
             } else {
@@ -297,6 +360,24 @@ void serve(const struct addrinfo *result) {
             }
 
         } // iterating over events
+
+        // check for terminated child process
+        if (cfg.cmdv) {
+            int status;
+            pid_t pid = waitpid(-1, &status, WNOHANG);
+            if (pid < 0)
+                if (errno != ECHILD)
+                    warn("waitpid");
+            if (pid > 0) {
+                /* Analyse and print exit status. */
+                if (WIFEXITED(status))
+                    warnx("Child %d returned %d", pid, WEXITSTATUS(status));
+                else if (WIFSIGNALED(status))
+                    warnx("Child %d caught %d", pid, WTERMSIG(status));
+                else
+                    warnx("Dunno why child %d terminated", pid);
+            }
+        }
 
     } while (sig == 0 && run);
 
@@ -338,7 +419,10 @@ void consume(const struct addrinfo *result) { // client role
     if (!rp)
         errx(1, "Could not connect");
 
-    communicate(sock);  // will close socket
+    if (cfg.cmdv)
+        execCommand(sock); // will not return
+    else
+        communicate(sock);
 
 }
 
@@ -353,18 +437,16 @@ int main(int argc, char **argv) {
 
     // CLI arguments
 
-    // help if wrong number of arguments
-    if (argc < 2 || 5 < argc) {
+    if (argc < 2) {
         printf("\n%s\n",
 #include "help.inc"
                );
         return 0;
     }
 
-    // parse CLI
     {
         int parc = 0;
-        char *parv[argc];
+        const char *parv[argc];
 
         // find optional flags amongst (ordered) parameters
         for (int i = 1; i < argc; i++) {
@@ -372,15 +454,17 @@ int main(int argc, char **argv) {
                 if (strcmp("-s", argv[i]) == 0)
                     cfg.serverRole = 1;
                 else if (strcmp("-q", argv[i]) == 0)
-                    cfg.quitAfter = 1;
+                    cfg.allowHalf = 0;
                 else if (strncmp("-b", argv[i], 2) == 0)
                     cfg.bufSize = (size_t)suffixed(argv[i]+2, volume);
-                else
+                else if (strcmp("--", argv[i]) == 0) {
+                    cfg.cmdv = &argv[i+1];
+                    i = argc;
+                } else
                     errx(1, "Unknown flag: %s", argv[i]);
             else
                 parv[parc++] = argv[i];
         }
-        cfg.serverRole = cfg.serverRole || cfg.quitAfter;
 
         if (parc < 1)
             errx(1, "Run without arguments for help.");
@@ -389,13 +473,15 @@ int main(int argc, char **argv) {
         if (parc > 1)
             cfg.host = parv[1];
 
-        warnx(
-            "pid %d, mode %s, service %s, address %s, buf %zu",
-            getpid(),
-            cfg.serverRole ? (cfg.quitAfter ? "serve once" : "serve many")
-                : "client",
-            cfg.service, cfg.host, cfg.bufSize
-        );
+        if (cfg.cmdv) {
+            if (!cfg.cmdv[0])
+                errx(1, "Empty command.");
+            if (cfg.bufSize)
+                warn("Buffer size not relevant when used with command.");
+        } else {
+            if (!cfg.bufSize)
+                cfg.bufSize = 1024;
+        }
 
     }
 
@@ -405,7 +491,7 @@ int main(int argc, char **argv) {
     SIGPIPE, because we want to produce error messages instead of
     being killed. */
     {
-        int handle[] = { SIGINT, SIGPIPE, 0 };
+        int handle[] = { SIGINT, SIGPIPE, SIGCHLD, 0 };
 
         struct sigaction action;
         memset(&action, 0, sizeof(action));

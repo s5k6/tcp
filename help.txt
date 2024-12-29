@@ -1,16 +1,17 @@
-Usage:
+Establish TCP/IP communication on PORT (by number or by name) of
+localhost, or HOST (by address or by name) if specified.
 
-    tcp [-s] [-q] [-bSIZE] SERVICE [HOST]
+    tcp [-s] PORT [HOST] -- COMMAND...
+    tcp [-s] PORT [HOST] [-bSIZE] [-q]
 
-Create TCP/IP connection to SERVICE of HOST, default `localhost`.
+When present, the order of PORT, HOST, `--` and COMMAND is mandatory.
 
-  -s — Be a server, rather than a client.  Handles clients one by one.
-    Terminate with Ctrl+C.
+If present, the COMMAND is run when the connection is established,
+with its standard IO replaced by the socket file descriptor, and
+inheriting stderr from `tcp`.  The server (`-s`) spawns a child for
+each connection, the client replaces itself with the command.
 
-  -q — Quit after serving first client, implies `-s`.
-
-  -bSIZE — Buffer size for all reading and writing, defaults to 1024,
-    accepts metric and binary suffix.
-
-When a peer disconnects (Ctrl+D without input, or Ctrl+C), then the
-client terminates, the server accepts the next client (unless `-q`).
+Otherwise, the standard streams of the `tcp` process are used for
+buffered IO.  Unless `-q` is given, the connection may be half-closed.
+Ths buffer's SIZE defaults to `1k` in bytes.  The server (`-s`) only
+accepts clients one by one.
