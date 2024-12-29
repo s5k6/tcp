@@ -83,12 +83,13 @@ If you want line buffering, modify the serving process:
     $ tcp 1234 -s -- stdbuf -oL rev
     $ tcp 1234 -q
 
-Note the use of `-q`, which makes the client terminates when the
-server's child process dies (try without `-q` on the client side, and
-then kill the process handling the connection on the server side).
+Note the use of `-q`, which makes the client terminate when the
+server's child process dies.  Try without `-q` on the client side, and
+then kill the process handling the connection on the server side — the
+client will wait for the other side to shut down the connection.
 
-The need for `-q` may depend on the use case, e.g., a server process
-may want to send data when the client closes its sending end of the
+The need for `-q` depends on the use case, e.g., a server process may
+want to send data when the client closes its sending end of the
 connection, as above for the not line-buffered invocation of `rev`.
 In that case, the client would terminate too early with `-q`:
 

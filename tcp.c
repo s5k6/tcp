@@ -16,8 +16,37 @@
 #include <unistd.h>
 
 
+/* Replace `close` */
 
-// parse an unsigned long with a suffix
+#define close(fd)                               \
+    do {                                        \
+        if (close(fd))                          \
+            err(1, "close(%d)", (fd));          \
+    } while (0)
+
+
+
+/*  one global variable capturing the configuration */
+
+static struct {
+    int serverRole;
+    int allowHalf;
+    const char *service;
+    const char *host;
+    char **cmdv;
+    size_t bufSize;
+} cfg = {
+    .serverRole = 0,
+    .allowHalf = 1,
+    .service = NULL,
+    .host = "localhost",
+    .cmdv = NULL,
+    .bufSize = 0
+};
+
+
+
+/*  parse an unsigned long with a suffix */
 
 struct suffix { const char *suf; const unsigned long int val; };
 
@@ -49,28 +78,8 @@ unsigned long int suffixed(const char *arg, const struct suffix *suffix) {
 
 
 
-// one global variable capturing the configuration
-
-static struct {
-    int serverRole;
-    int allowHalf;
-    const char *service;
-    const char *host;
-    char **cmdv;
-    size_t bufSize;
-} cfg = {
-    .serverRole = 0,
-    .allowHalf = 1,
-    .service = NULL,
-    .host = "localhost",
-    .cmdv = NULL,
-    .bufSize = 0
-};
-
-
-
-
-// representation of socket address
+/* Convert network address structure to a character string.  Simply a
+frontend to inet_ntop(3) which dispatches between IP and IPv6. */
 
 const char *sockaddr2string(
     const struct sockaddr *sa, char *dst, socklen_t lim, in_port_t *port
@@ -93,7 +102,7 @@ const char *sockaddr2string(
 
 
 
-// Signal handler: Store signal number.
+/*  Signal handler: Store signal number. */
 
 static int sig = 0; // Last signal received
 
@@ -113,13 +122,13 @@ ssize_t transfer(int from, int to, char *buf) {
 
     ssize_t readBytes = read(from, buf, cfg.bufSize);
     if (readBytes < 0)
-        err(1, "read(%d)", from);
+        err(1, "read(%d, %zu)", from, cfg.bufSize);
 
     for (ssize_t m = 0, q; m < readBytes; m += q) {
         size_t rest = (size_t)(readBytes - m);
         q = write(to, buf + m, rest);
         if (q < 0)
-            err(1, "write(%d)", to);
+            err(1, "write(%d, %zd)", to, rest);
     }
 
     return readBytes;
@@ -133,24 +142,23 @@ and handle errors. */
 #define epoll_add(EFD, EVENT, FD)                                       \
     do {                                                                \
         (EVENT).data.fd = (FD);                                         \
-        if (epoll_ctl(EFD, EPOLL_CTL_ADD, (FD), &(EVENT)) == -1)        \
-            err(1, "epoll_add(%d, %d)", EFD, (EVENT).data.fd);          \
-    } while(0)
-
+        if (epoll_ctl((EFD), EPOLL_CTL_ADD, (FD), &(EVENT)) == -1)      \
+            err(1, "epoll_add(%d, %d)", (EFD), (EVENT).data.fd);        \
+} while(0)
 
 #define epoll_del(EFD, FD)                                              \
     do {                                                                \
-        if (epoll_ctl(EFD, EPOLL_CTL_DEL, (FD), NULL) == -1)            \
-            err(1, "epoll_del(%d, %d)", EFD, (FD));                     \
+        if (epoll_ctl((EFD), EPOLL_CTL_DEL, (FD), NULL) == -1)          \
+            err(1, "epoll_del(%d, %d)", (EFD), (FD));                   \
     } while(0)
 
 
 
-// communication over established connections
+/*  communication over established connections */
 
 void communicate(int conn) {
 
-    // configure epoll for input events
+    /*  configure epoll for input events */
     int epollfd;
     {
         epollfd = epoll_create1(EPOLL_CLOEXEC);
@@ -164,7 +172,7 @@ void communicate(int conn) {
     }
 
 
-    // communicate
+    /*  communicate */
 
     char *buf = malloc(cfg.bufSize);
     if (buf == NULL)
@@ -176,7 +184,7 @@ void communicate(int conn) {
         const int maxEvents = 10;
         struct epoll_event events[maxEvents];
 
-        // -1 → no timeout
+        /*  -1 → no timeout */
         ssize_t eventCount = epoll_wait(epollfd, events, maxEvents, -1);
         if (eventCount < 0)
             if (errno != EINTR)
@@ -215,15 +223,14 @@ void communicate(int conn) {
     if (sig)
         warnx("Communicating loop caught signal %d", sig);
 
-    if (close(conn))
-        err(1, "close(%d)", conn);
-
-    warnx("Closed connection.");
 }
 
 
 
-void execCommand(int conn) {  // will not return
+/* Replace this programm with the configured command after setting
+stdin and stdout to the passed socket.  This will not return. */
+
+void execCommand(int conn) {
 
     if (dup2(conn, STDIN_FILENO) < 0)
         err(1, "dup2(%d, %d)", conn, STDIN_FILENO);
@@ -231,15 +238,17 @@ void execCommand(int conn) {  // will not return
     if (dup2(conn, STDOUT_FILENO) < 0)
         err(1, "dup2(%d, %d)", conn, STDOUT_FILENO);
 
-    if (close(conn) < 0)
-        err(1, "close");
+    close(conn);
 
     execvp(cfg.cmdv[0], cfg.cmdv);
-    err(1, "execv(%s, ...)", cfg.cmdv[0]);
+    err(1, "execvp(%s)", cfg.cmdv[0]);
 
 }
 
 
+
+/* Fork a child process running the configured command, wired to the
+passed connection. */
 
 void forkCommand(int conn) {
 
@@ -248,11 +257,10 @@ void forkCommand(int conn) {
         err(1, "fork");
 
     if (pid == 0)
-        execCommand(conn); // will not return
+        execCommand(conn);
 
-    // parent process
-    if (close(conn) < 0)
-        err(1, "close");
+    // only reached in the parent process
+    close(conn);
 
     warnx("Connection %d delegated to process %u", conn, pid);
 
@@ -260,15 +268,24 @@ void forkCommand(int conn) {
 
 
 
-void serve(const struct addrinfo *result) {
+/* Traverse the addrinfo list and try to bind and listen, until one
+succeeds.  The respective socket is returned.  Compare this
+line-by-line with `tryToConnect` below. */
 
-    int sock;
+int tryToBind(const struct addrinfo *result) {
+
+    int sock = -1;
+    char text[512];
+    in_port_t port;
 
     const struct addrinfo *rp;
     for (rp = result; rp; rp = rp->ai_next) {
 
-        char text[512];
-        in_port_t port;
+        if (sock >= 0) { // cleanup potential leftover from previous loop
+            close(sock);
+            sock = -1;
+        }
+
         if (!sockaddr2string(rp->ai_addr, text, sizeof(text), &port))
             err(1, "sockaddr2string");
 
@@ -278,26 +295,53 @@ void serve(const struct addrinfo *result) {
             continue;
         }
 
-        int opt;
-        if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)))
-            err(1, "setsockopt(%d)", sock);
-
-        if (bind(sock, rp->ai_addr, rp->ai_addrlen))
-            warn("bind(%d, %s port %d)", sock, text, port);
-        else {
-            warnx("Bound socket %d to %s port %d", sock, text, port);
-            if (listen(sock, 0))
-                warn("listen(%d)", sock);
-            else
-                break;  // success, stop trying
+        {
+            int opt = 1;
+            if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
+                warn("setsockopt(%d)", sock);
+                continue;
+            }
         }
-        close(sock); // was invalid
+
+        /* On exec, do not pass listening socket. */
+        {
+            int flags = fcntl(sock, F_GETFD);
+            if (flags == -1)
+                err(1, "fcntl(%d)", sock);
+            flags |= FD_CLOEXEC;
+            if (fcntl(sock, F_SETFD, flags) == -1)
+                err(1, "fcntl(%d)", sock);
+        }
+
+        if (bind(sock, rp->ai_addr, rp->ai_addrlen)) {
+            warn("bind(%d, %s port %d)", sock, text, port);
+            continue;
+        }
+
+        if (listen(sock, 0)) {
+            warn("listen(%d)", sock);
+            continue;
+        }
+
+        break;  // success, stop trying
     }
 
     if (!rp)
         errx(1, "Could not bind");
 
-    // configure epoll for multiplexing accept and discard stdin
+    warnx("Bound socket %d to %s port %d", sock, text, port);
+
+    return sock;
+}
+
+
+
+/* Serve clients connecting to the passed socked, which must have been
+set up as listening socket. */
+
+void serve(int sock) {
+
+    /*  configure epoll for multiplexing accept and discard stdin */
     int epollfd;
     {
         epollfd = epoll_create1(EPOLL_CLOEXEC);
@@ -310,7 +354,7 @@ void serve(const struct addrinfo *result) {
         epoll_add(epollfd, ev, sock);
     }
 
-    // this is the server loop, handling clients one by one
+    /*  this is the server loop, handling clients one by one */
     int run = 1;
     do {
         warnx("Waiting for connection...");
@@ -318,7 +362,7 @@ void serve(const struct addrinfo *result) {
         const int maxEvents = 10;
         struct epoll_event events[maxEvents];
 
-        // -1 → no timeout
+        /*  -1 → no timeout */
         ssize_t eventCount = epoll_wait(epollfd, events, maxEvents, -1);
         if (eventCount < 0)
             if (errno != EINTR)
@@ -330,7 +374,7 @@ void serve(const struct addrinfo *result) {
                 char *buf[512];
                 ssize_t c = read(STDIN_FILENO, buf, sizeof(buf));
                 if (c < 0)
-                    err(1, "read(%d)", STDIN_FILENO);
+                    err(1, "read(%d, %zu)", STDIN_FILENO, sizeof(buf));
                 warnx("Discard %zu bytes", c);
 
             } else if (events[i].data.fd == sock) {
@@ -361,7 +405,7 @@ void serve(const struct addrinfo *result) {
 
         } // iterating over events
 
-        // check for terminated child process
+        /*  check for terminated child processes */
         if (cfg.cmdv) {
             int status;
             pid_t pid = waitpid(-1, &status, WNOHANG);
@@ -384,21 +428,28 @@ void serve(const struct addrinfo *result) {
     if (sig)
         warnx("Accepting loop caught signal %d", sig);
 
-    close(sock);
-
 }
 
 
 
-void consume(const struct addrinfo *result) { // client role
+/* Traverse the addrinfo list and try to connect, until one succeeds.
+The respective socket is returned.  Compare this line-by-line with
+`tryToBind` above. */
 
-    int sock;
+int tryToConnect(const struct addrinfo *result) { // client role
+
+    int sock = -1;
+    char text[512];
+    in_port_t port;
 
     const struct addrinfo *rp;
     for (rp = result; rp; rp = rp->ai_next) {
 
-        char text[512];
-        in_port_t port;
+        if (sock >= 0) { // cleanup potential leftover from previous loop
+            close(sock);
+            sock = -1;
+        }
+
         if (!sockaddr2string(rp->ai_addr, text, sizeof(text), &port))
             err(1, "sockaddr2string");
 
@@ -408,19 +459,30 @@ void consume(const struct addrinfo *result) { // client role
             continue;
         }
 
-        if (connect(sock, rp->ai_addr, rp->ai_addrlen) > -1) {
-            warnx("Connected to %s port %d", text, port);
-            break;
+        if (connect(sock, rp->ai_addr, rp->ai_addrlen)) {
+            warn("connect(%d, %s port %d)", sock, text, port);
+            continue;
         }
-        warn("connect(%s port %d)", text, port);
-        close(sock); // was invalid
+
+        break;  // success, stop trying
     }
 
     if (!rp)
         errx(1, "Could not connect");
 
+    warnx("Connected socket %d to %s port %d", sock, text, port);
+
+    return sock;
+}
+
+
+
+/* Act as client on the passed socket.  This must have been connected. */
+
+void consume(int sock) {
+
     if (cfg.cmdv)
-        execCommand(sock); // will not return
+        execCommand(sock);
     else
         communicate(sock);
 
@@ -428,63 +490,71 @@ void consume(const struct addrinfo *result) { // client role
 
 
 
-int main(int argc, char **argv) {
+/* Command line interface */
 
-    // no buffering on stdout, must be set before doing any output.
-    setbuf(stdout, NULL);
-
-
-
-    // CLI arguments
+int parseCli(int argc, char **argv) {
 
     if (argc < 2) {
         printf("\n%s\n",
 #include "help.inc"
                );
+        return 1; // tell main to return 0
+    }
+
+
+    /* the fixed-order parameters PORT, HOST are collected here */
+    int parc = 0;
+    const char *parv[argc];
+
+    for (int i = 1; i < argc; i++) {
+        if (argv[i][0] == '-')
+            if (strcmp("-s", argv[i]) == 0)
+                cfg.serverRole = 1;
+            else if (strcmp("-q", argv[i]) == 0)
+                cfg.allowHalf = 0;
+            else if (strncmp("-b", argv[i], 2) == 0)
+                cfg.bufSize = (size_t)suffixed(argv[i]+2, volume);
+            else if (strcmp("--", argv[i]) == 0) {
+                cfg.cmdv = &argv[i+1];
+                i = argc;
+            } else
+                errx(1, "Unknown flag: %s", argv[i]);
+        else
+            parv[parc++] = argv[i];
+    }
+
+    /* collect ordered parameters */
+    if (parc < 1)
+        errx(1, "Run without arguments for help.");
+    cfg.service = parv[0];
+
+    if (parc > 1)
+        cfg.host = parv[1];
+
+    /* sanity checks */
+    if (cfg.cmdv) {
+        if (!cfg.cmdv[0])
+            errx(1, "Empty command.");
+        if (cfg.bufSize)
+            errx(1, "Buffer size (-b) not relevant with command.");
+        if (!cfg.allowHalf)
+            errx(1, "Forcing full duplex (-q) not relevant with command.");
+    } else {
+        if (!cfg.bufSize)
+            cfg.bufSize = 1024;
+    }
+
+    return 0;
+}
+
+
+
+int main(int argc, char **argv) {
+
+    setbuf(stdout, NULL); // must be set before doing output
+
+    if (parseCli(argc, argv))
         return 0;
-    }
-
-    {
-        int parc = 0;
-        const char *parv[argc];
-
-        // find optional flags amongst (ordered) parameters
-        for (int i = 1; i < argc; i++) {
-            if (argv[i][0] == '-')
-                if (strcmp("-s", argv[i]) == 0)
-                    cfg.serverRole = 1;
-                else if (strcmp("-q", argv[i]) == 0)
-                    cfg.allowHalf = 0;
-                else if (strncmp("-b", argv[i], 2) == 0)
-                    cfg.bufSize = (size_t)suffixed(argv[i]+2, volume);
-                else if (strcmp("--", argv[i]) == 0) {
-                    cfg.cmdv = &argv[i+1];
-                    i = argc;
-                } else
-                    errx(1, "Unknown flag: %s", argv[i]);
-            else
-                parv[parc++] = argv[i];
-        }
-
-        if (parc < 1)
-            errx(1, "Run without arguments for help.");
-        cfg.service = parv[0];
-
-        if (parc > 1)
-            cfg.host = parv[1];
-
-        if (cfg.cmdv) {
-            if (!cfg.cmdv[0])
-                errx(1, "Empty command.");
-            if (cfg.bufSize)
-                warn("Buffer size not relevant when used with command.");
-        } else {
-            if (!cfg.bufSize)
-                cfg.bufSize = 1024;
-        }
-
-    }
-
 
 
     /* Set up signal handlers: SIGINT, usually issued by pressing C-c.
@@ -506,7 +576,7 @@ int main(int argc, char **argv) {
 
 
 
-    /* Get the `result` set of address info records.  The will be
+    /* Get the `result` set of address info records.  These will be
     tried in turn until one can be used to listen (server) or to
     connect (client). */
 
@@ -528,12 +598,19 @@ int main(int argc, char **argv) {
             );
     }
 
-    if (cfg.serverRole)
-        serve(result);
-    else
-        consume(result);
+    int sock = cfg.serverRole ? tryToBind(result) : tryToConnect(result);
+    if (sock < 0)
+        errx(1, "Failed to create socket");
 
     freeaddrinfo(result);
+
+    if (cfg.serverRole)
+        serve(sock);
+    else
+        consume(sock);
+
+    warnx("Closing socket %d", sock);
+    close(sock);
 
     return 0;
 }
