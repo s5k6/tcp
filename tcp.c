@@ -14,6 +14,7 @@
 #include <sys/epoll.h>
 
 
+
 // parse an unsigned long with a suffix
 
 struct suffix { const char *suf; const unsigned long int val; };
@@ -43,6 +44,25 @@ unsigned long int suffixed(const char *arg, const struct suffix *suffix) {
 
     errx(1, "Invalid unit: `%s` following `%ld`", end, val);
 }
+
+
+
+// one global variable capturing the configuration
+
+static struct {
+    int serverRole;
+    int quitAfter;
+    const char *service;
+    const char *host;
+    size_t bufSize;
+} cfg = {
+    .serverRole = 0,
+    .quitAfter = 0,
+    .service = NULL,
+    .host = "localhost",
+    .bufSize = 1024
+};
+
 
 
 
@@ -79,21 +99,14 @@ static void handler(int s) {
 
 
 
-/* One buffer is enough for everything, so here it is. */
-
-static char *buf = NULL;
-
-static size_t bufSize = 1024;
-
-
-
 /* Copy bytes from one file descriptor to another.  Read into the
-global buffer once, then repeat writing until all is passed.  Thus,
-this may block. */
+passed buffer once, then repeat writing until all is passed.  Thus,
+this may block when writing blocks.  Being called only upon an epoll
+event, reading should never block. */
 
-ssize_t transfer(int from, int to) {
+ssize_t transfer(int from, int to, char *buf) {
 
-    ssize_t readBytes = read(from, buf, bufSize);
+    ssize_t readBytes = read(from, buf, cfg.bufSize);
     if (readBytes < 0)
         err(1, "read(%d)", from);
 
@@ -126,7 +139,6 @@ and handle errors. */
 void communicate(int conn) {
 
     // configure epoll for input events
-
     int epollfd;
     {
         epollfd = epoll_create1(EPOLL_CLOEXEC);
@@ -142,8 +154,13 @@ void communicate(int conn) {
 
     // communicate
 
+    char *buf = malloc(cfg.bufSize);
+    if (buf == NULL)
+        err(1, "malloc(%zu)", cfg.bufSize);
+
     int run = 1;
     do {
+
         const int maxEvents = 10;
         struct epoll_event events[maxEvents];
 
@@ -155,10 +172,10 @@ void communicate(int conn) {
 
         for (ssize_t i = 0; i < eventCount; i++) {
             if (events[i].data.fd == 0) { // stdin
-                if (transfer(0, conn) < 1)
+                if (transfer(0, conn, buf) < 1)
                     run = 0;
             } else if (events[i].data.fd == conn) {
-                if (transfer(conn, 1) < 1)
+                if (transfer(conn, 1, buf) < 1)
                     run = 0;
             } else {
                 errx(1, "unexpected event");
@@ -166,6 +183,8 @@ void communicate(int conn) {
         } // iterating over events
 
     } while (sig == 0 && run);
+
+    free(buf);
 
     if (sig)
         warnx("Communicating loop caught signal %d", sig);
@@ -177,6 +196,153 @@ void communicate(int conn) {
 
 
 
+void serve(const struct addrinfo *result) {
+
+    int sock;
+
+    const struct addrinfo *rp;
+    for (rp = result; rp; rp = rp->ai_next) {
+
+        char text[512];
+        in_port_t port;
+        if (!sockaddr2string(rp->ai_addr, text, sizeof(text), &port))
+            err(1, "sockaddr2string");
+
+        sock = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (sock < 0) {
+            warn("socket(%s port %d)", text, port);
+            continue;
+        }
+
+        int opt;
+        if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)))
+            err(1, "setsockopt(%d)", sock);
+
+        if (bind(sock, rp->ai_addr, rp->ai_addrlen))
+            warn("bind(%d, %s port %d)", sock, text, port);
+        else {
+            warnx("Bound socket %d to %s port %d", sock, text, port);
+            if (listen(sock, 0))
+                warn("listen(%d)", sock);
+            else
+                break;  // success, stop trying
+        }
+        close(sock); // was invalid
+    }
+
+    if (!rp)
+        errx(1, "Could not bind");
+
+    // configure epoll for multiplexing accept and discard stdin
+    int epollfd;
+    {
+        epollfd = epoll_create1(EPOLL_CLOEXEC);
+        if (epollfd == -1)
+            err(1, "epoll_create1");
+
+        struct epoll_event ev;
+        ev.events = EPOLLIN;
+        epoll_add(epollfd, ev, 0);
+        epoll_add(epollfd, ev, sock);
+    }
+
+    // this is the server loop, handling clients one by one
+    int run = 1;
+    do {
+        warnx("Waiting for connection...");
+
+        const int maxEvents = 10;
+        struct epoll_event events[maxEvents];
+
+        // -1 → no timeout
+        ssize_t eventCount = epoll_wait(epollfd, events, maxEvents, -1);
+        if (eventCount < 0)
+            if (errno != EINTR)
+                err(1, "epoll_wait(%d)", epollfd);
+
+
+        for (ssize_t i = 0; i < eventCount; i++) {
+
+            if (events[i].data.fd == 0) { // discard stdin
+                char *buf[512];
+                ssize_t c = read(0, buf, sizeof(buf));
+                if (c < 0)
+                    err(1, "read(0)");
+                warnx("Discard %zu bytes", c);
+
+            } else if (events[i].data.fd == sock) {
+
+                struct sockaddr peer;
+                socklen_t peerLen = sizeof(peer);
+                int conn = accept(sock, &peer, &peerLen);
+                if (conn < 0)
+                    warn("accept(%d)", sock);
+                else {
+                    char remote[512];
+                    in_port_t port;
+                    if (!sockaddr2string(
+                            &peer, remote, sizeof(remote), &port
+                        ))
+                        err(1, "sockaddr2string");
+                    warnx("Connected from %s port %d", remote, port);
+
+                    communicate(conn);  // will close conn socket
+
+                    if (cfg.quitAfter)
+                        run = 0;
+                }
+
+            } else {
+                errx(1, "unexpected event");
+            }
+
+        } // iterating over events
+
+    } while (sig == 0 && run);
+
+    if (sig)
+        warnx("Accepting loop caught signal %d", sig);
+
+    close(sock);
+
+}
+
+
+
+void consume(const struct addrinfo *result) { // client role
+
+    int sock;
+
+    const struct addrinfo *rp;
+    for (rp = result; rp; rp = rp->ai_next) {
+
+        char text[512];
+        in_port_t port;
+        if (!sockaddr2string(rp->ai_addr, text, sizeof(text), &port))
+            err(1, "sockaddr2string");
+
+        sock = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (sock < 0) {
+            warn("socket(%s port %d)", text, port);
+            continue;
+        }
+
+        if (connect(sock, rp->ai_addr, rp->ai_addrlen) > -1) {
+            warnx("Connected to %s port %d", text, port);
+            break;
+        }
+        warn("connect(%s port %d)", text, port);
+        close(sock); // was invalid
+    }
+
+    if (!rp)
+        errx(1, "Could not connect");
+
+    communicate(sock);  // will close socket
+
+}
+
+
 
 int main(int argc, char **argv) {
 
@@ -184,12 +350,8 @@ int main(int argc, char **argv) {
     setbuf(stdout, NULL);
 
 
-    // CLI arguments
 
-    int serverRole = 0, quitAfter = 0;
-    const char *service;
-    const char *host = "localhost";
-    bufSize = 1024;
+    // CLI arguments
 
     // help if wrong number of arguments
     if (argc < 2 || 5 < argc) {
@@ -208,39 +370,35 @@ int main(int argc, char **argv) {
         for (int i = 1; i < argc; i++) {
             if (argv[i][0] == '-')
                 if (strcmp("-s", argv[i]) == 0)
-                    serverRole = 1;
+                    cfg.serverRole = 1;
                 else if (strcmp("-q", argv[i]) == 0)
-                    quitAfter = 1;
+                    cfg.quitAfter = 1;
                 else if (strncmp("-b", argv[i], 2) == 0)
-                    bufSize = (size_t)suffixed(argv[i]+2, volume);
+                    cfg.bufSize = (size_t)suffixed(argv[i]+2, volume);
                 else
                     errx(1, "Unknown flag: %s", argv[i]);
             else
                 parv[parc++] = argv[i];
         }
-        serverRole = serverRole || quitAfter;
+        cfg.serverRole = cfg.serverRole || cfg.quitAfter;
 
         if (parc < 1)
             errx(1, "Run without arguments for help.");
-        service = parv[0];
+        cfg.service = parv[0];
 
         if (parc > 1)
-            host = parv[1];
+            cfg.host = parv[1];
 
         warnx(
             "pid %d, mode %s, service %s, address %s, buf %zu",
             getpid(),
-            serverRole ? (quitAfter ? "serve once" : "serve many") : "client",
-            service, host, bufSize
+            cfg.serverRole ? (cfg.quitAfter ? "serve once" : "serve many")
+                : "client",
+            cfg.service, cfg.host, cfg.bufSize
         );
 
     }
 
-
-    // allocate the buffer
-    buf = malloc(bufSize);
-    if (buf == NULL)
-        err(1, "malloc(%zu)", bufSize);
 
 
     /* Set up signal handlers: SIGINT, usually issued by pressing C-c.
@@ -273,158 +431,23 @@ int main(int argc, char **argv) {
         hints.ai_family = AF_UNSPEC;
         hints.ai_socktype = SOCK_STREAM;
 
-        int s = getaddrinfo(host, service, &hints, &result);
+        int s = getaddrinfo(cfg.host, cfg.service, &hints, &result);
         if (s) // getaddrinfo does not use errno
-            errx(1, "getaddrinfo(%s, %s): %s", host, service, gai_strerror(s));
+            errx(
+                1,
+                "getaddrinfo(%s, %s): %s",
+                cfg.host,
+                cfg.service,
+                gai_strerror(s)
+            );
     }
 
+    if (cfg.serverRole)
+        serve(result);
+    else
+        consume(result);
 
-
-    if (serverRole) {
-
-        int sock;
-
-        struct addrinfo *rp;
-        for (rp = result; rp; rp = rp->ai_next) {
-
-            char text[512];
-            in_port_t port;
-            if (!sockaddr2string(rp->ai_addr, text, sizeof(text), &port))
-                err(1, "sockaddr2string");
-
-            sock = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-            if (sock < 0) {
-                warn("socket(%s port %d)", text, port);
-                continue;
-            }
-
-            int opt;
-            if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)))
-                err(1, "setsockopt(%d)", sock);
-
-            if (bind(sock, rp->ai_addr, rp->ai_addrlen))
-                warn("bind(%d, %s port %d)", sock, text, port);
-            else {
-                warnx("Bound socket %d to %s port %d", sock, text, port);
-                if (listen(sock, 0))
-                    warn("listen(%d)", sock);
-                else
-                    break;  // success, stop trying
-            }
-            close(sock); // was invalid
-        }
-
-        if (!rp)
-            errx(1, "Could not bind");
-
-        // configure epoll for multiplexing accept and discard stdin
-        int epollfd;
-        {
-            epollfd = epoll_create1(EPOLL_CLOEXEC);
-            if (epollfd == -1)
-                err(1, "epoll_create1");
-
-            struct epoll_event ev;
-            ev.events = EPOLLIN;
-            epoll_add(epollfd, ev, 0);
-            epoll_add(epollfd, ev, sock);
-        }
-
-        // this is the server loop, handling clients one by one
-        int run = 1;
-        do {
-            warnx("Waiting for connection...");
-
-            const int maxEvents = 10;
-            struct epoll_event events[maxEvents];
-
-            // -1 → no timeout
-            ssize_t eventCount = epoll_wait(epollfd, events, maxEvents, -1);
-            if (eventCount < 0)
-                if (errno != EINTR)
-                    err(1, "epoll_wait(%d)", epollfd);
-
-
-            for (ssize_t i = 0; i < eventCount; i++) {
-
-                if (events[i].data.fd == 0) { // discard stdin
-                    ssize_t c = read(0, buf, bufSize);
-                    if (c < 0)
-                        err(1, "read(0)");
-                    warnx("Discard %zu bytes", c);
-
-                } else if (events[i].data.fd == sock) {
-
-                    struct sockaddr peer;
-                    socklen_t peerLen = sizeof(peer);
-                    int conn = accept(sock, &peer, &peerLen);
-                    if (conn < 0)
-                        warn("accept(%d)", sock);
-                    else {
-                        char remote[512];
-                        in_port_t port;
-                        if (!sockaddr2string(
-                                &peer, remote, sizeof(remote), &port
-                            ))
-                            err(1, "sockaddr2string");
-                        warnx("Connected from %s port %d", remote, port);
-
-                        communicate(conn);  // will close conn socket
-
-                        if (quitAfter)
-                            run = 0;
-                    }
-
-                } else {
-                    errx(1, "unexpected event");
-                }
-
-            } // iterating over events
-
-        } while (sig == 0 && run);
-
-        if (sig)
-            warnx("Accepting loop caught signal %d", sig);
-
-        close(sock);
-
-    } else { // client role
-
-        int sock;
-
-        struct addrinfo *rp;
-        for (rp = result; rp; rp = rp->ai_next) {
-
-            char text[512];
-            in_port_t port;
-            if (!sockaddr2string(rp->ai_addr, text, sizeof(text), &port))
-                err(1, "sockaddr2string");
-
-            sock = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-            if (sock < 0) {
-                warn("socket(%s port %d)", text, port);
-                continue;
-            }
-
-            if (connect(sock, rp->ai_addr, rp->ai_addrlen) > -1) {
-                warnx("Connected to %s port %d", text, port);
-                break;
-            }
-            warn("connect(%s port %d)", text, port);
-            close(sock); // was invalid
-        }
-
-        if (!rp)
-            errx(1, "Could not connect");
-
-        communicate(sock);  // will close socket
-
-    }
-
-
-    // pointless at end of program
     freeaddrinfo(result);
-    free(buf);
 
     return 0;
 }
