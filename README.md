@@ -96,9 +96,9 @@ In that case, the client would terminate too early with `-q`:
     $ tcp 1234 -s -- rev
     $ tcp 1234 -q             # bad
 
-A command can also be used `tcp` is run as client.  The command simply
-replaces `tcp` after establishing a connection.  The following sends a
-string back and forth:
+A command can also be used when `tcp` is run as client.  The command
+simply replaces `tcp` after establishing a connection.  The following
+sends a string back and forth:
 
     $ tcp 1234 -s -- sh -c 'while read x; do echo "$x"; sleep 1; done'
     $ tcp 1234 -- sh -c 'date; stdbuf -oL rev | tee /dev/stderr'

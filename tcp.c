@@ -551,8 +551,6 @@ int parseCli(int argc, char **argv) {
 
 int main(int argc, char **argv) {
 
-    setbuf(stdout, NULL); // must be set before doing output
-
     if (parseCli(argc, argv))
         return 0;
 

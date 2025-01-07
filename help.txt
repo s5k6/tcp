@@ -1,17 +1,15 @@
 Establish TCP/IP communication on PORT (by number or by name) of
-localhost, or HOST (by address or by name) if specified.
+localhost (default) or HOST (by address or by name) if specified.
 
     tcp [-s] PORT [HOST] -- COMMAND...
     tcp [-s] PORT [HOST] [-bSIZE] [-q]
 
-When present, the order of PORT, HOST, `--` and COMMAND is mandatory.
+The order of mandatory arguments is relevant.
 
-If present, the COMMAND is run when the connection is established,
-with its standard IO replaced by the socket file descriptor, and
-inheriting stderr from `tcp`.  The server (`-s`) spawns a child for
+The first form runs COMMAND when the connection is established, with
+the socket for stdin/stdout.  The server (`-s`) spawns a child for
 each connection, the client replaces itself with the command.
 
-Otherwise, the standard streams of the `tcp` process are used for
-buffered IO.  Unless `-q` is given, the connection may be half-closed.
-Ths buffer's SIZE defaults to `1k` in bytes.  The server (`-s`) only
-accepts clients one by one.
+The second form uses stdin/stdout for buffered IO.  The buffer's SIZE
+defaults to `1ki` bytes.  With `-q` any shutdown(2) closes the
+connection.  The server (`-s`) only accepts clients sequentially.
